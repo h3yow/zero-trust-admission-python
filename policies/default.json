@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0",
+  "metadata": {
+    "description": "默认零信任准入策略：仅示例身份/组可读 docs，admin 可写；限流按身份+资源独立计数"
+  },
+  "rules": [
+    {
+      "name": "deny-all-default",
+      "effect": "deny",
+      "identities": ["*"],
+      "groups": [],
+      "resources": ["*"],
+      "actions": ["*"],
+      "priority": 0
+    },
+    {
+      "name": "allow-dev-read-docs",
+      "effect": "allow",
+      "identities": ["*"],
+      "groups": ["dev"],
+      "resources": ["docs"],
+      "actions": ["read"],
+      "priority": 10
+    },
+    {
+      "name": "allow-alice-write-docs",
+      "effect": "allow",
+      "identities": ["alice"],
+      "groups": [],
+      "resources": ["docs"],
+      "actions": ["read", "write"],
+      "priority": 20
+    },
+    {
+      "name": "deny-delete-anyone",
+      "effect": "deny",
+      "identities": ["*"],
+      "groups": [],
+      "resources": ["docs"],
+      "actions": ["delete"],
+      "priority": 30
+    }
+  ],
+  "rate_limits": [
+    {
+      "name": "docs-rate-global",
+      "identities": ["*"],
+      "groups": [],
+      "resources": ["docs"],
+      "rate_limit": 5,
+      "rate_window_seconds": 1.0,
+      "concurrency": 2
+    },
+    {
+      "name": "docs-rate-alice-strict",
+      "identities": ["alice"],
+      "groups": [],
+      "resources": ["docs"],
+      "rate_limit": 3,
+      "rate_window_seconds": 1.0,
+      "concurrency": 1
+    }
+  ]
+}
