@@ -1,0 +1,103 @@
+{
+  "apiVersion": "zero-trust-admission/v1",
+  "kind": "AdmissionPolicy",
+  "metadata": {
+    "name": "default",
+    "version": 1
+  },
+  "rules": [
+    {
+      "id": "healthz-anon-get",
+      "description": "任意身份可访问健康检查",
+      "effect": "allow",
+      "subject": {},
+      "resource": {
+        "type": "system",
+        "patterns": [
+          "/healthz"
+        ]
+      },
+      "action": {
+        "methods": [
+          "GET"
+        ]
+      }
+    },
+    {
+      "id": "docs-admin-read",
+      "description": "管理员可读取文档",
+      "effect": "allow",
+      "subject": {
+        "roles": [
+          "admin"
+        ],
+        "users": [
+          "alice"
+        ]
+      },
+      "resource": {
+        "type": "document",
+        "patterns": [
+          "docs/*"
+        ]
+      },
+      "action": {
+        "methods": [
+          "GET"
+        ]
+      },
+      "rateLimit": {
+        "maxRequests": 3,
+        "windowSeconds": 1.0
+      },
+      "concurrencyLimit": {
+        "maxInFlight": 3
+      }
+    },
+    {
+      "id": "docs-mallory-deny",
+      "description": "mallory 对文档的所有访问被显式拒绝",
+      "effect": "deny",
+      "subject": {
+        "users": [
+          "mallory"
+        ]
+      },
+      "resource": {
+        "type": "document",
+        "patterns": [
+          "docs/*"
+        ]
+      },
+      "action": {}
+    },
+    {
+      "id": "echo-admin-write",
+      "description": "管理员可调用受保护回显接口，便于演示限流/并发/下游异常",
+      "effect": "allow",
+      "subject": {
+        "roles": [
+          "admin"
+        ]
+      },
+      "resource": {
+        "type": "api",
+        "patterns": [
+          "/api/echo"
+        ]
+      },
+      "action": {
+        "methods": [
+          "POST"
+        ]
+      },
+      "rateLimit": {
+        "maxRequests": 3,
+        "windowSeconds": 1.0
+      },
+      "concurrencyLimit": {
+        "maxInFlight": 2
+      }
+    }
+  ]
+}
