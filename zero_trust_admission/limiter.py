@@ -1,16 +1,24 @@
 """按身份与资源维度的限流与并发约束。
 
-- 限流使用滑动日志窗口，每个 ``(身份, 资源)`` 键拥有独立的时间戳队列与独立锁；
+- 限流使用滑动日志窗口，每个计数键拥有独立的时间戳队列与独立锁；
   过期时间戳被惰性清理，突发流量下计数只属于自己的键，不跨身份串号。
 - 并发使用每键信号量，获取/释放严格配对；下游异常时由调用方在 finally 中释放。
 - 时间来源可注入（``now``），保证判定在测试中确定且可复现。
+
+计数键分两套、物理隔离：
+
+- 老策略（single 模式）使用 ``(身份, 资源)`` 二元组，行为保持不变；
+- 分层配额（layered 模式）使用
+  ``("layer-rate"|"layer-conc", 策略名, 作用域三元组)``，作用域由
+  :func:`layer_scope` 解析为 identity / group / resource 三档，
+  每个策略层拥有独立窗口与信号量。
 """
 
 from __future__ import annotations
 
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 
 from .model import (
@@ -75,6 +83,45 @@ def select_rate_limit_policy(
     return max(candidates, key=lambda p: (_specificity(p, req.principal), _neg_name(p.name)))
 
 
+def select_rate_limit_layers(
+    req: AccessRequest, policies: tuple[RateLimitPolicy, ...]
+) -> tuple[RateLimitPolicy, ...]:
+    """返回全部命中的限流策略，作为分层配额的各层。
+
+    顺序固定：具体度降序（显式身份 > 组 > 通配身份；显式资源 > 通配资源），
+    同分时按策略名称字典序升序，保证任何并发强度、任何命名下判定与展示
+    顺序都不漂移。
+    """
+    candidates = [p for p in policies if rate_limit_matches_request(req, p)]
+    candidates.sort(key=lambda p: (-_specificity(p, req.principal), p.name))
+    return tuple(candidates)
+
+
+def layer_scope(
+    req: AccessRequest, policy: RateLimitPolicy
+) -> tuple[tuple[str, str, str], str]:
+    """分层模式下某条策略对当前请求的计数归属。
+
+    返回 ``(计数键, 人类可读作用域)``：
+    - 显式身份层 -> ``identity:<身份>``；
+    - 组层（租户/组）-> ``group:<组名>``，多组命中时取名称字典序最小者，
+      保证同一请求在任何顺序的策略定义下计数桶都唯一确定；
+    - 通配身份层 -> ``resource:<资源>`` 的资源整体层。
+    """
+    principal = req.principal
+    if principal.identity in policy.identities:
+        key = ("identity", principal.identity, req.resource)
+        return key, f"identity:{principal.identity}@{req.resource}"
+    if policy.groups:
+        matched = sorted(set(policy.groups) & set(principal.groups))
+        if matched:
+            group = matched[0]
+            key = ("group", group, req.resource)
+            return key, f"group:{group}@{req.resource}"
+    key = ("resource", "*", req.resource)
+    return key, f"resource:{req.resource}"
+
+
 def _neg_name(name: str) -> str:
     # 仅用于让 max 在 specificity 同分时稳定（名称字典序最小者胜出）
     return "".join(chr(0x10FFFF - ord(ch)) for ch in name)
@@ -89,14 +136,18 @@ class _KeyGuard:
 
 
 class SlidingWindowRateLimiter:
-    """滑动日志窗口限流器。"""
+    """滑动日志窗口限流器。
+
+    内部状态以不透明元组为键：老策略沿用 ``(身份, 资源)`` 二元组，分层
+    模式使用 :func:`layer_scope` 产出的三元组，两者键空间互不重叠，老策略
+    的计数行为保持不变。
+    """
 
     def __init__(self) -> None:
-        self._guards: dict[tuple[str, str], _KeyGuard] = {}
+        self._guards: dict[tuple, _KeyGuard] = {}
         self._registry_lock = threading.Lock()
 
-    def _guard_for(self, identity: str, resource: str) -> _KeyGuard:
-        key = (identity, resource)
+    def _guard_for(self, key: tuple) -> _KeyGuard:
         guard = self._guards.get(key)
         if guard is not None:
             return guard
@@ -107,6 +158,62 @@ class SlidingWindowRateLimiter:
                 self._guards[key] = guard
             return guard
 
+    def check_key(
+        self,
+        key: tuple,
+        threshold: int,
+        window: float,
+        *,
+        now: float | None = None,
+    ) -> tuple[bool, int, int]:
+        """在显式计数键上检查并登记一次请求。
+
+        返回 ``(是否允许, 窗口内当前计数, 阈值)``。
+        超限时本次时间戳**不登记**，保证被拒请求不会占用任何一层的配额。
+        """
+        current = time.monotonic() if now is None else now
+        guard = self._guard_for(key)
+        with guard.lock:
+            horizon = current - window
+            events = guard.events
+            while events and events[0] <= horizon:
+                events.popleft()
+            if len(events) >= threshold:
+                return False, len(events), threshold
+            events.append(current)
+            return True, len(events), threshold
+
+    def retract_key(self, key: tuple, timestamp: float) -> bool:
+        """在显式计数键上精确撤回此前登记的时间戳。
+
+        优先移除队尾等值时间戳；队尾不一致时按值定位，避免并发下误撤
+        其他请求的登记；返回是否成功撤回。
+        """
+        guard = self._guards.get(key)
+        if guard is None:
+            return False
+        with guard.lock:
+            if guard.events and guard.events[-1] == timestamp:
+                guard.events.pop()
+                return True
+            try:
+                guard.events.remove(timestamp)
+                return True
+            except ValueError:
+                return False
+
+    def current_count_key(
+        self, key: tuple, window: float, *, now: float | None = None
+    ) -> int:
+        """只读查看显式键的当前窗口计数，不登记、不修改状态。"""
+        current = time.monotonic() if now is None else now
+        guard = self._guards.get(key)
+        if guard is None:
+            return 0
+        with guard.lock:
+            horizon = current - window
+            return sum(1 for ts in guard.events if ts > horizon)
+
     def check(
         self,
         req: AccessRequest,
@@ -114,24 +221,19 @@ class SlidingWindowRateLimiter:
         *,
         now: float | None = None,
     ) -> tuple[bool, int, int]:
-        """检查并登记一次请求。
+        """检查并登记一次请求（老策略键 ``(身份, 资源)``）。
 
         返回 ``(是否允许, 窗口内当前计数, 阈值)``。
         超限时本次时间戳**不登记**，保证被拒请求不会占用正常流量的配额。
         """
         if policy.rate_limit is None or policy.rate_window_seconds is None:
             return True, 0, 0
-        current = time.monotonic() if now is None else now
-        guard = self._guard_for(req.principal.identity, req.resource)
-        with guard.lock:
-            horizon = current - policy.rate_window_seconds
-            events = guard.events
-            while events and events[0] <= horizon:
-                events.popleft()
-            if len(events) >= policy.rate_limit:
-                return False, len(events), policy.rate_limit
-            events.append(current)
-            return True, len(events), policy.rate_limit
+        return self.check_key(
+            (req.principal.identity, req.resource),
+            policy.rate_limit,
+            policy.rate_window_seconds,
+            now=now,
+        )
 
     def retract(
         self,
@@ -139,24 +241,10 @@ class SlidingWindowRateLimiter:
         policy: RateLimitPolicy,
         timestamp: float,
     ) -> bool:
-        """精确撤回此前登记的时间戳（后续阶段拒绝时回滚配额）。
-
-        仅当该键队尾时间戳与传入值完全相等时才移除，避免在并发下误撤
-        其他请求的登记；返回是否成功撤回。
-        """
-        guard = self._guards.get((req.principal.identity, req.resource))
-        if guard is None:
-            return False
-        with guard.lock:
-            if guard.events and guard.events[-1] == timestamp:
-                guard.events.pop()
-                return True
-            # 队尾不一致时，在队列中按值定位（同键串行登记，理论上不会发生）
-            try:
-                guard.events.remove(timestamp)
-                return True
-            except ValueError:
-                return False
+        """精确撤回此前登记的时间戳（后续阶段拒绝时回滚配额）。"""
+        return self.retract_key(
+            (req.principal.identity, req.resource), timestamp
+        )
 
     def current_count(
         self,
@@ -167,13 +255,7 @@ class SlidingWindowRateLimiter:
         now: float | None = None,
     ) -> int:
         """只读查看当前窗口计数，不登记、不修改状态。"""
-        current = time.monotonic() if now is None else now
-        guard = self._guards.get((identity, resource))
-        if guard is None:
-            return 0
-        with guard.lock:
-            horizon = current - window
-            return sum(1 for ts in guard.events if ts > horizon)
+        return self.current_count_key((identity, resource), window, now=now)
 
     def reset(self) -> None:
         with self._registry_lock:
@@ -181,16 +263,19 @@ class SlidingWindowRateLimiter:
 
 
 class ConcurrencyLimiter:
-    """每键信号量并发限制器。"""
+    """每键信号量并发限制器。
+
+    键空间规则与 :class:`SlidingWindowRateLimiter` 一致：老策略二元组、
+    分层模式三元组，互不干扰。
+    """
 
     def __init__(self) -> None:
-        self._semaphores: dict[tuple[str, str], threading.BoundedSemaphore] = {}
+        self._semaphores: dict[tuple, threading.BoundedSemaphore] = {}
         self._registry_lock = threading.Lock()
 
     def _semaphore_for(
-        self, identity: str, resource: str, limit: int
+        self, key: tuple, limit: int
     ) -> threading.BoundedSemaphore:
-        key = (identity, resource)
         sem = self._semaphores.get(key)
         if sem is not None:
             return sem
@@ -201,20 +286,14 @@ class ConcurrencyLimiter:
                 self._semaphores[key] = sem
             return sem
 
-    def acquire(
-        self, req: AccessRequest, policy: RateLimitPolicy, *, blocking: bool = False
+    def acquire_key(
+        self, key: tuple, limit: int, *, blocking: bool = False
     ) -> bool:
-        if policy.concurrency is None:
-            return True
-        sem = self._semaphore_for(
-            req.principal.identity, req.resource, policy.concurrency
-        )
+        sem = self._semaphore_for(key, limit)
         return sem.acquire(blocking=blocking)
 
-    def release(self, req: AccessRequest, policy: RateLimitPolicy) -> None:
-        if policy.concurrency is None:
-            return
-        sem = self._semaphores.get((req.principal.identity, req.resource))
+    def release_key(self, key: tuple) -> None:
+        sem = self._semaphores.get(key)
         if sem is not None:
             try:
                 sem.release()
@@ -222,13 +301,34 @@ class ConcurrencyLimiter:
                 # 未配对释放属于编程错误，显式暴露而不是静默吞掉
                 raise RuntimeError("并发信号量释放次数超过获取次数")
 
+    def active_key(self, key: tuple, limit: int) -> int:
+        sem = self._semaphores.get(key)
+        if sem is None:
+            return 0
+        return limit - sem._value  # type: ignore[attr-defined]
+
+    def acquire(
+        self, req: AccessRequest, policy: RateLimitPolicy, *, blocking: bool = False
+    ) -> bool:
+        if policy.concurrency is None:
+            return True
+        return self.acquire_key(
+            (req.principal.identity, req.resource),
+            policy.concurrency,
+            blocking=blocking,
+        )
+
+    def release(self, req: AccessRequest, policy: RateLimitPolicy) -> None:
+        if policy.concurrency is None:
+            return
+        self.release_key((req.principal.identity, req.resource))
+
     def active(self, req: AccessRequest, policy: RateLimitPolicy) -> int:
         if policy.concurrency is None:
             return 0
-        sem = self._semaphores.get((req.principal.identity, req.resource))
-        if sem is None:
-            return 0
-        return policy.concurrency - sem._value  # type: ignore[attr-defined]
+        return self.active_key(
+            (req.principal.identity, req.resource), policy.concurrency
+        )
 
     def reset(self) -> None:
         with self._registry_lock:
@@ -239,7 +339,9 @@ __all__ = [
     "SlidingWindowRateLimiter",
     "ConcurrencyLimiter",
     "select_rate_limit_policy",
+    "select_rate_limit_layers",
     "rate_limit_matches_request",
     "request_matches_rule",
     "principal_matches_rule",
+    "layer_scope",
 ]

@@ -55,7 +55,7 @@ def _to_domain(req: EvaluateRequest) -> AccessRequest:
 
 
 def _result_payload(result) -> dict[str, Any]:
-    return {
+    payload = {
         "decision": result.decision.value,
         "reason": result.reason.value if result.reason else None,
         "matched_rule": result.matched_rule.rule_name if result.matched_rule else None,
@@ -63,6 +63,22 @@ def _result_payload(result) -> dict[str, Any]:
         "detail": result.detail,
         "request": result.request_summary,
     }
+    # 仅分层判定携带层链；老策略（single）下不出现该键，载荷与历史完全一致
+    if result.quota_layers:
+        payload["quota_layers"] = [
+            {
+                "order": layer.order,
+                "policy": layer.policy_name,
+                "allowed": layer.allowed,
+                "scope": layer.scope,
+                "used": layer.used,
+                "threshold": layer.threshold,
+                "in_flight": layer.in_flight,
+                "concurrency": layer.concurrency,
+            }
+            for layer in result.quota_layers
+        ]
+    return payload
 
 
 def create_app(
@@ -126,6 +142,7 @@ def create_app(
         doc = guard._store.current()  # noqa: SLF001 - 装配层内受控访问
         return {
             "schema_version": doc.schema_version,
+            "quota_mode": doc.quota_mode,
             "rules": [
                 {
                     "name": r.name,

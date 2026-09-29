@@ -4,14 +4,20 @@
 
 1. 声明式规则匹配：最高优先级命中规则决定 allow/deny；无任何命中 ->
    零信任默认拒绝（``no_matching_policy``），绝不回退到更宽松的规则。
-2. 限流：滑动窗口超阈值 -> ``rate_limited``，被拒请求不登记、不占配额。
-3. 并发：每键信号量获取失败 -> ``concurrency_limited``。
-4. 审计写入（admission 阶段）：
+2. 配额判定，按文档 ``quota.mode``（或构造期 ``quota_mode`` 覆盖）分流：
+   - single（默认，老策略语义）：只取最具体的一条限流策略；
+   - layered：所有命中策略按 身份 > 组 > 资源整体 的固定顺序逐层判定，
+     任一层不过即拒绝并精确退回此前各层已登记名额；详见
+     :meth:`AdmissionGuard._evaluate_layered`。
+3. 限流：滑动窗口超阈值 -> ``rate_limited``，被拒请求不登记、不占配额。
+4. 并发：每键信号量获取失败 -> ``concurrency_limited``。
+5. 审计写入（admission 阶段）：
    - fail_closed（默认）：审计不可用则释放已获取并发槽并拒绝
      （``audit_unavailable``），保证不存在"已放行却无记录"；
    - fail_open：显式降级放行，记录进入有界内存缓冲并计数，日志明示。
-5. 下游执行（:meth:`AdmissionGuard.execute_guarded`）：异常时在
-   ``downstream`` 阶段审计中记录错误类型与消息，finally 中确定性释放并发槽。
+6. 下游执行（:meth:`AdmissionGuard.execute_guarded`）：异常时在
+   ``downstream`` 阶段审计中记录错误类型与消息，finally 中确定性释放全部
+   持有并发槽（single 模式一个键、layered 模式按层逐一释放）。
 """
 
 from __future__ import annotations
@@ -34,7 +40,9 @@ from .audit import (
 from .limiter import (
     ConcurrencyLimiter,
     SlidingWindowRateLimiter,
+    layer_scope,
     request_matches_rule,
+    select_rate_limit_layers,
     select_rate_limit_policy,
 )
 from .model import (
@@ -47,6 +55,8 @@ from .model import (
     MatchedRule,
     PolicyDocument,
     Principal,
+    QuotaLayerResult,
+    QuotaMode,
     RateLimitPolicy,
 )
 from .policy_store import PolicyStore
@@ -139,6 +149,7 @@ class AdmissionGuard:
         audit_sink: AuditSink,
         *,
         audit_failure_mode: str = AuditFailureMode.FAIL_CLOSED,
+        quota_mode: str | None = None,
         rate_limiter: SlidingWindowRateLimiter | None = None,
         concurrency_limiter: ConcurrencyLimiter | None = None,
     ) -> None:
@@ -147,9 +158,16 @@ class AdmissionGuard:
                 f"非法审计失败模式 {audit_failure_mode!r}，"
                 f"合法值: {AuditFailureMode.VALID}"
             )
+        if quota_mode is not None and quota_mode not in QuotaMode.VALID:
+            raise ValueError(
+                f"非法配额模式 {quota_mode!r}，合法值: {QuotaMode.VALID}"
+            )
         self._store = policy_store
         self._sink = audit_sink
         self._failure_mode = audit_failure_mode
+        # None 表示跟随策略文档的 quota.mode（老文档缺省即 single，
+        # 因此老策略在不改动文件的前提下行为完全不变）
+        self._quota_mode_override = quota_mode
         self._rate_limiter = rate_limiter or SlidingWindowRateLimiter()
         self._concurrency = concurrency_limiter or ConcurrencyLimiter()
         self._stats_lock = threading.Lock()
@@ -177,6 +195,41 @@ class AdmissionGuard:
     @property
     def failure_mode(self) -> str:
         return self._failure_mode
+
+    def _resolve_quota_mode(self, doc: PolicyDocument) -> str:
+        return self._quota_mode_override or doc.quota_mode
+
+    @staticmethod
+    def _layer_rate_key(policy: RateLimitPolicy, scope_key: tuple) -> tuple:
+        # 每个策略层拥有独立窗口：即便两层作用域相同也不共用计数
+        return ("layer-rate", policy.name, scope_key)
+
+    @staticmethod
+    def _layer_concurrency_key(
+        policy: RateLimitPolicy, scope_key: tuple
+    ) -> tuple:
+        return ("layer-conc", policy.name, scope_key)
+
+    @staticmethod
+    def _scope_key_from_label(label: str) -> tuple:
+        """把 :class:`QuotaLayerResult` 的作用域标签还原成计数键。
+
+        释放槽位时只依赖判定结果自带信息，策略随后被热替换也能精确释放。
+        """
+        if label.startswith("resource:"):
+            return ("resource", "*", label[len("resource:") :])
+        head, _, resource = label.partition("@")
+        kind, _, name = head.partition(":")
+        return (kind, name, resource)
+
+    def _release_layer_slots(self, req: AccessRequest, result: AdmissionResult) -> None:
+        for layer in result.quota_layers:
+            if layer.concurrency is None:
+                continue
+            scope_key = self._scope_key_from_label(layer.scope)
+            self._concurrency.release_key(
+                ("layer-conc", layer.policy_name, scope_key)
+            )
 
     # ---- 审计写入与失败模式 ---------------------------------------------
 
@@ -216,6 +269,12 @@ class AdmissionGuard:
 
         if decision is Decision.DENY:
             return self._finalize_deny(req, summary, reason, matched, basis)
+
+        # 规则允许：按文档 quota.mode（或构造期显式覆盖）选择配额判定路径
+        if self._resolve_quota_mode(doc) == QuotaMode.LAYERED:
+            return self._evaluate_layered(
+                req, summary, matched, doc, basis, now=now
+            )
 
         # 规则允许，继续限流判定
         rate_policy = select_rate_limit_policy(req, doc.rate_limits)
@@ -307,6 +366,221 @@ class AdmissionGuard:
         self._count_decision(Decision.ALLOW)
         return result
 
+    def _evaluate_layered(
+        self,
+        req: AccessRequest,
+        summary: dict[str, Any],
+        matched: MatchedRule | None,
+        doc: PolicyDocument,
+        basis: dict[str, Any],
+        *,
+        now: float | None = None,
+    ) -> AdmissionResult:
+        """分层配额判定：所有命中层按固定顺序逐一检查，任一层不过即拒绝。
+
+        - 被某层拒绝时该层本身不登记；此前已通过各层登记的限流名额会被
+          精确撤回、并发槽被释放，被拒请求不占任何一层的名额；
+        - 短路后尚未判定到的层在结果中标记 ``allowed=None``，其静态阈值
+          仍一并展示，完整呈现本次受约束的层链；
+        - 整次判定使用同一个单调时钟读数（真实时钟，不注入时），各层
+          窗口独立滑动恢复。
+        """
+        moment = time.monotonic() if now is None else now
+        layers = select_rate_limit_layers(req, doc.rate_limits)
+        basis["quota_mode"] = QuotaMode.LAYERED
+        basis["quota_layers"] = [p.name for p in layers]
+
+        # 已完成登记、需要在失败时回滚的层：(计数键, 登记时间戳)
+        rate_holds: list[tuple[tuple, float]] = []
+        # 已获取并发槽、需要在失败时释放的层：计数键
+        conc_holds: list[tuple] = []
+        results: list[QuotaLayerResult] = []
+
+        def _rollback() -> None:
+            for key, ts in rate_holds:
+                self._rate_limiter.retract_key(key, ts)
+            for key in conc_holds:
+                self._concurrency.release_key(key)
+
+        for index, policy in enumerate(layers):
+            scope_key, scope_label = layer_scope(req, policy)
+            rate_key = self._layer_rate_key(policy, scope_key)
+            conc_key = self._layer_concurrency_key(policy, scope_key)
+
+            # ---- 该层限流窗口 ----
+            if policy.rate_limit is not None and policy.rate_window_seconds is not None:
+                allowed, used, threshold = self._rate_limiter.check_key(
+                    rate_key,
+                    policy.rate_limit,
+                    policy.rate_window_seconds,
+                    now=moment,
+                )
+                if not allowed:
+                    # 本层未登记；短路层之后的层不再判定
+                    results.append(
+                        QuotaLayerResult(
+                            order=index,
+                            policy_name=policy.name,
+                            allowed=False,
+                            scope=scope_label,
+                            used=used,
+                            threshold=threshold,
+                            in_flight=self._concurrency.active_key(
+                                conc_key, policy.concurrency
+                            )
+                            if policy.concurrency is not None
+                            else None,
+                            concurrency=policy.concurrency,
+                        )
+                    )
+                    self._append_skipped_layers(
+                        results, layers[index + 1 :], req, start=index + 1
+                    )
+                    _rollback()
+                    basis["denied_at"] = "rate_limit"
+                    basis["blocked_layer"] = policy.name
+                    return self._finalize_deny(
+                        req,
+                        summary,
+                        DenyReason.RATE_LIMITED,
+                        matched,
+                        basis,
+                        rate_policy=policy,
+                        quota_layers=tuple(results),
+                        detail=(
+                            f"层 {policy.name}（{scope_label}）窗口内请求数 {used} "
+                            f"已达限流阈值 {threshold}，该层拦截"
+                        ),
+                    )
+                rate_holds.append((rate_key, moment))
+            else:
+                used = self._rate_limiter.current_count_key(
+                    rate_key,
+                    policy.rate_window_seconds or 0.0,
+                    now=moment,
+                )
+                threshold = None
+
+            # ---- 该层并发槽 ----
+            in_flight = (
+                self._concurrency.active_key(conc_key, policy.concurrency)
+                if policy.concurrency is not None
+                else None
+            )
+            if policy.concurrency is not None:
+                if not self._concurrency.acquire_key(conc_key, policy.concurrency):
+                    results.append(
+                        QuotaLayerResult(
+                            order=index,
+                            policy_name=policy.name,
+                            allowed=False,
+                            scope=scope_label,
+                            used=used,
+                            threshold=policy.rate_limit,
+                            in_flight=in_flight,
+                            concurrency=policy.concurrency,
+                        )
+                    )
+                    self._append_skipped_layers(
+                        results, layers[index + 1 :], req, start=index + 1
+                    )
+                    _rollback()
+                    basis["denied_at"] = "concurrency"
+                    basis["blocked_layer"] = policy.name
+                    basis["concurrency_limit"] = policy.concurrency
+                    return self._finalize_deny(
+                        req,
+                        summary,
+                        DenyReason.CONCURRENCY_LIMITED,
+                        matched,
+                        basis,
+                        rate_policy=policy,
+                        quota_layers=tuple(results),
+                        detail=(
+                            f"层 {policy.name}（{scope_label}）在途并发 {in_flight} "
+                            f"已达上限 {policy.concurrency}，该层拦截"
+                        ),
+                    )
+                conc_holds.append(conc_key)
+                in_flight += 1
+
+            results.append(
+                QuotaLayerResult(
+                    order=index,
+                    policy_name=policy.name,
+                    allowed=True,
+                    scope=scope_label,
+                    used=used,
+                    threshold=policy.rate_limit,
+                    in_flight=in_flight,
+                    concurrency=policy.concurrency,
+                )
+            )
+
+        # ---- 所有层通过：写审计 ----
+        quota_layers = tuple(results)
+        result = AdmissionResult(
+            decision=Decision.ALLOW,
+            reason=None,
+            request_summary=summary,
+            matched_rule=matched,
+            rate_limit=layers[0] if layers else None,
+            detail=(
+                "全部配额层通过"
+                if layers
+                else "规则通过，且未配置命中的配额层"
+            ),
+            quota_layers=quota_layers,
+        )
+        record = build_audit_record(phase="admission", result=result)
+        written = self._write_audit(record)
+
+        if not written and self._failure_mode == AuditFailureMode.FAIL_CLOSED:
+            _rollback()
+            fail_result = AdmissionResult(
+                decision=Decision.DENY,
+                reason=DenyReason.AUDIT_UNAVAILABLE,
+                request_summary=summary,
+                matched_rule=matched,
+                rate_limit=layers[0] if layers else None,
+                detail="审计后端不可用且失败模式为 fail_closed，按零信任原则拒绝",
+                quota_layers=quota_layers,
+            )
+            basis["denied_at"] = "audit"
+            basis["audit_failure_mode"] = self._failure_mode
+            logger.info("准入判定依据: %s", json.dumps(basis, ensure_ascii=False))
+            self._count_decision(fail_result.decision)
+            return fail_result
+
+        basis["audit_written"] = written
+        if not written:
+            basis["audit_failure_mode"] = self._failure_mode
+            basis["detail"] = "审计不可用，按显式 fail_open 配置降级放行并缓冲记录"
+        logger.info("准入判定依据: %s", json.dumps(basis, ensure_ascii=False))
+        self._count_decision(Decision.ALLOW)
+        return result
+
+    def _append_skipped_layers(
+        self,
+        results: list[QuotaLayerResult],
+        skipped: tuple[RateLimitPolicy, ...],
+        req: AccessRequest,
+        *,
+        start: int,
+    ) -> None:
+        for offset, policy in enumerate(skipped):
+            _, scope_label = layer_scope(req, policy)
+            results.append(
+                QuotaLayerResult(
+                    order=start + offset,
+                    policy_name=policy.name,
+                    allowed=None,
+                    scope=scope_label,
+                    threshold=policy.rate_limit,
+                    concurrency=policy.concurrency,
+                )
+            )
+
     def _finalize_deny(
         self,
         req: AccessRequest,
@@ -317,6 +591,7 @@ class AdmissionGuard:
         *,
         rate_policy: RateLimitPolicy | None = None,
         detail: str | None = None,
+        quota_layers: tuple[QuotaLayerResult, ...] = (),
     ) -> AdmissionResult:
         if detail is None:
             if reason is DenyReason.NO_MATCHING_POLICY:
@@ -330,6 +605,7 @@ class AdmissionGuard:
             matched_rule=matched,
             rate_limit=rate_policy,
             detail=detail or "",
+            quota_layers=quota_layers,
         )
         # 拒绝同样审计；审计失败不影响拒绝结论，但计数并缓冲以便解释
         self._write_audit(build_audit_record(phase="admission", result=result))
@@ -345,20 +621,21 @@ class AdmissionGuard:
                 self._stats["deny"] += 1
 
     def release(self, result: AdmissionResult) -> None:
-        """显式释放某次允许判定持有的并发槽。"""
-        if result.decision is not Decision.ALLOW or result.rate_limit is None:
+        """显式释放某次允许判定持有的并发槽（兼容 single 与 layered 模式）。"""
+        if result.decision is not Decision.ALLOW:
             return
-        if result.rate_limit.concurrency is not None:
-            from .model import AccessRequest as _AR  # local: 通过 summary 重建
-
-            req = _AR(
-                Principal(
-                    result.request_summary["identity"],
-                    tuple(result.request_summary.get("groups", [])),
-                ),
-                result.request_summary["resource"],
-                Action(result.request_summary["action"]),
-            )
+        req = AccessRequest(
+            Principal(
+                result.request_summary["identity"],
+                tuple(result.request_summary.get("groups", [])),
+            ),
+            result.request_summary["resource"],
+            Action(result.request_summary["action"]),
+        )
+        if result.quota_layers:
+            self._release_layer_slots(req, result)
+            return
+        if result.rate_limit is not None and result.rate_limit.concurrency is not None:
             self._concurrency.release(req, result.rate_limit)
 
     # ---- 下游执行包装 ---------------------------------------------------
@@ -385,8 +662,13 @@ class AdmissionGuard:
                 self._stats["downstream_errors"] += 1
             logger.warning("下游调用异常: %s", downstream_error)
         finally:
-            # 无论下游成功或异常，并发槽必须确定性释放
-            if result.rate_limit is not None and result.rate_limit.concurrency is not None:
+            # 无论下游成功或异常，各层并发槽必须确定性释放
+            if result.quota_layers:
+                self._release_layer_slots(req, result)
+            elif (
+                result.rate_limit is not None
+                and result.rate_limit.concurrency is not None
+            ):
                 self._concurrency.release(req, result.rate_limit)
             completion = build_audit_record(
                 phase="downstream",

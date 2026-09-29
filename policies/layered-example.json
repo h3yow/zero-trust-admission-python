@@ -1,0 +1,58 @@
+{
+  "schema_version": "1.0",
+  "metadata": {
+    "description": "分层配额示例：个人档 / 组（租户）档 / 资源整体档同时生效，任一层不过即拒绝"
+  },
+  "quota": {
+    "mode": "layered"
+  },
+  "rules": [
+    {
+      "name": "deny-all-default",
+      "effect": "deny",
+      "identities": ["*"],
+      "groups": [],
+      "resources": ["*"],
+      "actions": ["*"],
+      "priority": 0
+    },
+    {
+      "name": "allow-dev-read-docs",
+      "effect": "allow",
+      "identities": ["*"],
+      "groups": ["dev"],
+      "resources": ["docs"],
+      "actions": ["read"],
+      "priority": 10
+    }
+  ],
+  "rate_limits": [
+    {
+      "name": "docs-rate-global",
+      "identities": ["*"],
+      "groups": [],
+      "resources": ["docs"],
+      "rate_limit": 100,
+      "rate_window_seconds": 1.0,
+      "concurrency": 20
+    },
+    {
+      "name": "docs-rate-tenant-dev",
+      "identities": ["*"],
+      "groups": ["dev"],
+      "resources": ["docs"],
+      "rate_limit": 20,
+      "rate_window_seconds": 1.0,
+      "concurrency": 8
+    },
+    {
+      "name": "docs-rate-alice-personal",
+      "identities": ["alice"],
+      "groups": [],
+      "resources": ["docs"],
+      "rate_limit": 5,
+      "rate_window_seconds": 1.0,
+      "concurrency": 2
+    }
+  ]
+}

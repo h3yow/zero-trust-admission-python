@@ -40,6 +40,20 @@ class DenyReason(str, Enum):
     AUDIT_UNAVAILABLE = "audit_unavailable"
 
 
+class QuotaMode:
+    """配额约束的生效模式。
+
+    - ``single``（默认，老策略语义）：一个请求只命中一条最具体的限流策略；
+    - ``layered``：所有命中的限流策略作为多个配额层**同时**生效，
+      任一层不过即拒绝，全部通过才放行。
+    """
+
+    SINGLE = "single"
+    LAYERED = "layered"
+
+    VALID = (SINGLE, LAYERED)
+
+
 @dataclass(frozen=True, slots=True)
 class Principal:
     """请求发起方身份。"""
@@ -88,12 +102,38 @@ class RateLimitPolicy:
 
 @dataclass(frozen=True, slots=True)
 class PolicyDocument:
-    """一份策略文档：版本、准入规则与限流规则。"""
+    """一份策略文档：版本、准入规则与限流规则。
+
+    ``quota_mode`` 缺省为 :attr:`QuotaMode.SINGLE`，保证不显式开启分层时
+    行为与老策略完全一致。
+    """
 
     schema_version: str
     rules: tuple[Rule, ...] = ()
     rate_limits: tuple[RateLimitPolicy, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    quota_mode: str = QuotaMode.SINGLE
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaLayerResult:
+    """单条配额层在一次判定中的可解释结果。
+
+    - ``order``：该层在固定判定顺序中的序号（0 起，最具体的层最先判定）；
+    - ``allowed``：True 放行；False 该层拦截；None 短路时尚未判定到该层；
+    - ``used`` / ``threshold``：判定时该层窗口内用量与阈值；
+    - ``in_flight`` / ``concurrency``：判定时在途并发数与并发上限；
+    - ``scope``：该层计数归属的人类可读标识（身份 / 组 / 资源全域）。
+    """
+
+    order: int
+    policy_name: str
+    allowed: bool | None
+    scope: str
+    used: int | None = None
+    threshold: int | None = None
+    in_flight: int | None = None
+    concurrency: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +147,13 @@ class MatchedRule:
 
 @dataclass(frozen=True, slots=True)
 class AdmissionResult:
-    """准入 + 限流的综合判定结果。"""
+    """准入 + 限流的综合判定结果。
+
+    ``rate_limit``/``detail`` 等字段在两种模式下保持稳定：老策略
+    （single 模式）下 ``quota_layers`` 恒为空元组，对外载荷与历史一致；
+    layered 模式下被拒时 ``rate_limit`` 指向第一个拦截层，``quota_layers``
+    携带按固定顺序排列的各层用量、阈值与判定情况。
+    """
 
     decision: Decision
     reason: DenyReason | None
@@ -115,6 +161,7 @@ class AdmissionResult:
     matched_rule: MatchedRule | None = None
     rate_limit: RateLimitPolicy | None = None
     detail: str = ""
+    quota_layers: tuple[QuotaLayerResult, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

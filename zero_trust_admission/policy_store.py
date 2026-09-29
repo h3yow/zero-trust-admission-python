@@ -25,6 +25,7 @@ from .model import (
     Action,
     Effect,
     PolicyDocument,
+    QuotaMode,
     RateLimitPolicy,
     Rule,
 )
@@ -167,6 +168,21 @@ def find_conflict(
     return None
 
 
+def _parse_quota_mode(data: dict[str, Any]) -> str:
+    """解析文档级 ``quota.mode``；字段缺省或不提供 quota 时保持 single。"""
+    quota = data.get("quota", None)
+    if quota is None:
+        return QuotaMode.SINGLE
+    if not isinstance(quota, dict):
+        raise PolicyFormatError("字段 quota 必须是对象")
+    mode = quota.get("mode", QuotaMode.SINGLE)
+    if mode not in QuotaMode.VALID:
+        raise PolicyValidationError(
+            f"quota.mode 非法 {mode!r}，合法值: {', '.join(QuotaMode.VALID)}"
+        )
+    return mode
+
+
 def parse_policy_dict(data: object) -> PolicyDocument:
     """把已解析的 JSON 数据校验并转换为 :class:`PolicyDocument`。
 
@@ -213,6 +229,7 @@ def parse_policy_dict(data: object) -> PolicyDocument:
         rules=rules,
         rate_limits=rate_limits,
         metadata=data.get("metadata", {}) if isinstance(data.get("metadata", {}), dict) else {},
+        quota_mode=_parse_quota_mode(data),
     )
     # 文档内部冲突检测
     conflict = find_conflict(doc.rules, doc.rules)
@@ -290,13 +307,16 @@ class PolicyStore:
                 )
 
             version = document.schema_version
+            quota_mode = document.quota_mode
             if base is not None:
                 version = base.schema_version
+                quota_mode = base.quota_mode
             merged = PolicyDocument(
                 schema_version=version,
                 rules=base_rules + document.rules,
                 rate_limits=base_limits + document.rate_limits,
                 metadata={**(base.metadata if base is not None else {}), **document.metadata},
+                quota_mode=quota_mode,
             )
             self._previous = self._document
             self._document = merged
