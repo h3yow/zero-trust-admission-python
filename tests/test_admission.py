@@ -157,7 +157,7 @@ def test_rate_limited_request_does_not_consume_quota(guard, alice):
 
 
 def test_every_decision_has_audit_record_consistent_with_result(guard, alice, bob):
-    deny = guard.evaluate(ar("stranger"))
+    guard.evaluate(ar("stranger"))
     allow = guard.evaluate(ar("bob", groups=("dev",)), now=1.0)
     guard.release(allow)
     records = guard._sink.records  # type: ignore[attr-defined]

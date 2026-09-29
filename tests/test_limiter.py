@@ -8,8 +8,8 @@ from zero_trust_admission.limiter import (
     select_rate_limit_policy,
 )
 from zero_trust_admission.model import (
-    Action,
     AccessRequest,
+    Action,
     Principal,
     RateLimitPolicy,
 )
@@ -37,7 +37,7 @@ def test_sliding_window_allows_then_denies_then_recovers():
     r = req("alice")
     results = [limiter.check(r, p, now=100 + i)[0] for i in range(3)]
     assert results == [True, True, True]
-    allowed, count, threshold = limiter.check(r, p, now=103)
+    allowed, count, threshold, _ = limiter.check(r, p, now=103)
     assert allowed is False and count == 3 and threshold == 3
     # 窗口滑过后恢复
     assert limiter.check(r, p, now=110.001)[0] is True
@@ -66,11 +66,11 @@ def test_repeated_denied_requests_do_not_drift_count():
     r = req("alice")
     assert limiter.check(r, p, now=0)[0]
     for i in range(10):
-        ok, count, _ = limiter.check(r, p, now=1 + i * 0.1)
+        ok, count, _, _ = limiter.check(r, p, now=1 + i * 0.1)
         assert ok is False
         assert count == 1  # 重复超限请求不登记，计数不漂移
     # bob 的正常流量未被误伤
-    ok, count, _ = limiter.check(req("bob"), p, now=1)
+    ok, count, _, _ = limiter.check(req("bob"), p, now=1)
     assert ok and count == 1
 
 
@@ -78,10 +78,16 @@ def test_retract_restores_quota():
     limiter = SlidingWindowRateLimiter()
     p = policy(limit=1)
     r = req("alice")
-    assert limiter.check(r, p, now=0)[0]
+    allowed0, _, _, token0 = limiter.check(r, p, now=0)
+    assert allowed0
     assert limiter.check(r, p, now=0)[0] is False
-    assert limiter.retract(r, p, 0.0) is True
+    # 按登记令牌精确退回（真实时钟下时间戳可能重复，令牌唯一）
+    assert limiter.retract(r, p, token0) is True
     assert limiter.check(r, p, now=0)[0]
+    # 老调用方按时间戳退回仍然兼容
+    allowed1, _, _, _ = limiter.check(r, p, now=20)
+    assert allowed1
+    assert limiter.retract(r, p, 20.0) is True
 
 
 def test_concurrency_semaphore_isolated_and_released():

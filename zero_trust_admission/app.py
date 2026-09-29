@@ -55,7 +55,7 @@ def _to_domain(req: EvaluateRequest) -> AccessRequest:
 
 
 def _result_payload(result) -> dict[str, Any]:
-    return {
+    payload = {
         "decision": result.decision.value,
         "reason": result.reason.value if result.reason else None,
         "matched_rule": result.matched_rule.rule_name if result.matched_rule else None,
@@ -63,6 +63,22 @@ def _result_payload(result) -> dict[str, Any]:
         "detail": result.detail,
         "request": result.request_summary,
     }
+    # 仅分层模式追加 rate_layers；老策略响应字段与以前完全一致
+    if result.rate_layers:
+        payload["rate_layers"] = [
+            {
+                "order": layer.order,
+                "policy": layer.policy_name,
+                "allowed": layer.allowed,
+                "denied_at": layer.denied_at,
+                "rate_count": layer.rate_count,
+                "rate_threshold": layer.rate_threshold,
+                "concurrency_active": layer.concurrency_active,
+                "concurrency_limit": layer.concurrency_limit,
+            }
+            for layer in result.rate_layers
+        ]
+    return payload
 
 
 def create_app(
@@ -123,9 +139,10 @@ def create_app(
 
     @application.get("/api/v1/policy")
     def get_policy():
-        doc = guard._store.current()  # noqa: SLF001 - 装配层内受控访问
+        doc = guard._store.current()
         return {
             "schema_version": doc.schema_version,
+            "rate_limit_mode": doc.rate_limit_mode,
             "rules": [
                 {
                     "name": r.name,
@@ -155,7 +172,7 @@ def create_app(
     @application.put("/api/v1/policy")
     def replace_policy(body: dict[str, Any]):
         try:
-            doc = guard._store.load_dict(body)  # noqa: SLF001
+            doc = guard._store.load_dict(body)
         except PolicyError as exc:
             return JSONResponse(
                 status_code=422,

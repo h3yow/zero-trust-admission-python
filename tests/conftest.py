@@ -13,12 +13,11 @@ import pytest
 from zero_trust_admission.admission import AdmissionGuard
 from zero_trust_admission.audit import InMemoryAuditSink
 from zero_trust_admission.model import (
-    Action,
+    Effect,
     PolicyDocument,
     Principal,
     RateLimitPolicy,
     Rule,
-    Effect,
 )
 from zero_trust_admission.policy_store import PolicyStore
 

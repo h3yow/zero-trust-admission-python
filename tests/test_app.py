@@ -4,15 +4,14 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
 
 from zero_trust_admission.admission import AdmissionGuard
+from zero_trust_admission.app import create_app
 from zero_trust_admission.audit import InMemoryAuditSink
 from zero_trust_admission.policy_store import PolicyStore
-from zero_trust_admission.app import create_app
 
 from .conftest import make_document
 
@@ -159,8 +158,8 @@ def test_protected_resource_and_stats(client):
 def test_jsonl_audit_sink_persists_decisions(tmp_path):
     from zero_trust_admission.audit import JsonlAuditSink
     from zero_trust_admission.model import (
-        Action,
         AccessRequest,
+        Action,
         Decision,
         DenyReason,
         Principal,
@@ -171,7 +170,8 @@ def test_jsonl_audit_sink_persists_decisions(tmp_path):
     guard = AdmissionGuard(store, JsonlAuditSink(path))
     guard.evaluate(AccessRequest(Principal("stranger"), "docs", Action.READ))
     guard._sink.close()
-    lines = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
+    with open(path, encoding="utf-8") as fh:
+        lines = [json.loads(line) for line in fh if line.strip()]
     assert len(lines) == 1
     assert lines[0]["decision"] == Decision.DENY.value
     assert lines[0]["reason"] == DenyReason.EXPLICIT_DENY.value

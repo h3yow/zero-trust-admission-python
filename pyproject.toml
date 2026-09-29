@@ -24,3 +24,16 @@ log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 log_level = "INFO"
 testpaths = "tests"
 addopts = "-ra"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+# 静态检查基线：逻辑错误（F/pyflakes）、导入与 __all__ 排序（I/RUF022）、
+# 现代化改写（UP）与常用简化（SIM）
+select = ["E4", "E7", "E9", "F", "I", "UP", "SIM", "RUF022"]
+# SIM115（open 需用上下文管理器）对刻意长开句柄的审计 sink 不适用；
+# SIM103 会牺牲"早返回守卫"的可读性；UP042 要求改用 StrEnum，
+# 项目刻意保持 (str, Enum) 显式写法
+ignore = ["SIM115", "SIM103", "UP042"]

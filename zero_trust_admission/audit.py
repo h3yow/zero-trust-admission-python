@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -37,6 +38,14 @@ def _record_to_dict(record: AuditRecord) -> dict[str, Any]:
     data = dataclasses.asdict(record)
     data["decision"] = record.decision.value
     data["reason"] = record.reason.value if record.reason is not None else None
+    if record.rate_layers:
+        # 分层模式：保留各配额层明细（含拦截层阈值与当时用量）
+        data["rate_layers"] = [
+            dataclasses.asdict(layer) for layer in record.rate_layers
+        ]
+    else:
+        # 老策略兼容路径：输出结构与分层能力上线前完全一致
+        data.pop("rate_layers", None)
     return data
 
 
@@ -59,7 +68,8 @@ class JsonlAuditSink(AuditSink):
         parent = os.path.dirname(os.path.abspath(path))
         try:
             os.makedirs(parent, exist_ok=True)
-            self._fh = open(path, "a", encoding="utf-8")
+            # sink 生命周期内持续追加写入，文件句柄刻意保持长开并在 close() 关闭
+            self._fh = open(path, "a", encoding="utf-8")  # noqa: SIM115
         except OSError as exc:
             raise AuditUnavailableError(
                 f"无法打开审计文件 {path!r}: {exc}"
@@ -78,11 +88,8 @@ class JsonlAuditSink(AuditSink):
             ) from exc
 
     def close(self) -> None:
-        with self._lock:
-            try:
-                self._fh.close()
-            except OSError:
-                pass
+        with self._lock, contextlib.suppress(OSError):
+            self._fh.close()
 
 
 class InMemoryAuditSink(AuditSink):
@@ -125,10 +132,10 @@ class FailingAuditSink(AuditSink):
 
 
 __all__ = [
-    "AuditSink",
-    "JsonlAuditSink",
-    "InMemoryAuditSink",
-    "FailingAuditSink",
     "AuditFailureMode",
+    "AuditSink",
     "AuditUnavailableError",
+    "FailingAuditSink",
+    "InMemoryAuditSink",
+    "JsonlAuditSink",
 ]

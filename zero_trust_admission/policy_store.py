@@ -25,6 +25,7 @@ from .model import (
     Action,
     Effect,
     PolicyDocument,
+    RateLimitMode,
     RateLimitPolicy,
     Rule,
 )
@@ -208,11 +209,19 @@ def parse_policy_dict(data: object) -> PolicyDocument:
             f"限流策略名称重复: {', '.join(sorted(dup_l))}"
         )
 
+    mode = data.get("rate_limit_mode", RateLimitMode.MOST_SPECIFIC)
+    if not isinstance(mode, str) or mode not in RateLimitMode.VALID:
+        raise PolicyValidationError(
+            f"字段 rate_limit_mode 非法 {mode!r}，合法值: "
+            f"{', '.join(RateLimitMode.VALID)}"
+        )
+
     doc = PolicyDocument(
         schema_version=version,
         rules=rules,
         rate_limits=rate_limits,
         metadata=data.get("metadata", {}) if isinstance(data.get("metadata", {}), dict) else {},
+        rate_limit_mode=mode,
     )
     # 文档内部冲突检测
     conflict = find_conflict(doc.rules, doc.rules)
@@ -290,13 +299,17 @@ class PolicyStore:
                 )
 
             version = document.schema_version
+            mode = document.rate_limit_mode
             if base is not None:
                 version = base.schema_version
+                # 合并语义沿用在运文档的叠加模式，分片不能各自改变全局模式
+                mode = base.rate_limit_mode
             merged = PolicyDocument(
                 schema_version=version,
                 rules=base_rules + document.rules,
                 rate_limits=base_limits + document.rate_limits,
                 metadata={**(base.metadata if base is not None else {}), **document.metadata},
+                rate_limit_mode=mode,
             )
             self._previous = self._document
             self._document = merged
@@ -314,7 +327,7 @@ class PolicyStore:
         return self.load_dict(data)
 
     def load_json_file(self, path: str) -> PolicyDocument:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return self.load_json(fh.read())
 
     def merge_json(self, text: str) -> PolicyDocument:
@@ -325,4 +338,4 @@ class PolicyStore:
         return self.merge(parse_policy_dict(data))
 
 
-__all__ = ["PolicyStore", "PolicyError", "parse_policy_dict", "find_conflict"]
+__all__ = ["PolicyError", "PolicyStore", "find_conflict", "parse_policy_dict"]

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -38,6 +38,21 @@ class DenyReason(str, Enum):
     CONCURRENCY_LIMITED = "concurrency_limited"
     POLICY_INVALID = "policy_invalid"
     AUDIT_UNAVAILABLE = "audit_unavailable"
+
+
+class RateLimitMode:
+    """限流策略的叠加模式。
+
+    - ``MOST_SPECIFIC``（默认）：一个请求只受命中策略中"最具体的一条"
+      约束，行为与分层能力上线前完全一致（老策略兼容路径）。
+    - ``LAYERED``：所有命中的策略各自成为一层配额，请求必须同时通过
+      每一层；任一层拒绝即整体拒绝。
+    """
+
+    MOST_SPECIFIC = "most_specific"
+    LAYERED = "layered"
+
+    VALID = (MOST_SPECIFIC, LAYERED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +109,7 @@ class PolicyDocument:
     rules: tuple[Rule, ...] = ()
     rate_limits: tuple[RateLimitPolicy, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    rate_limit_mode: str = RateLimitMode.MOST_SPECIFIC
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,8 +122,32 @@ class MatchedRule:
 
 
 @dataclass(frozen=True, slots=True)
+class RateLayerResult:
+    """单层配额的检查结果（可解释、顺序固定）。
+
+    每一层对应一条命中的 :class:`RateLimitPolicy`；``order`` 为该层在
+    本次判定中的固定序号（从 0 开始），阈值与用量字段在该层不设对应
+    约束时为 ``None``。
+    """
+
+    order: int
+    policy_name: str
+    allowed: bool
+    denied_at: str | None = None
+    rate_count: int | None = None
+    rate_threshold: int | None = None
+    concurrency_active: int | None = None
+    concurrency_limit: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionResult:
-    """准入 + 限流的综合判定结果。"""
+    """准入 + 限流的综合判定结果。
+
+    ``rate_limit`` 沿用单策略（最具体一条）语义：老模式下即命中的那条
+    策略；分层模式拒绝时指向第一个拦下请求的层，便于老消费方解释。
+    ``rate_layers`` 仅在分层模式下填充，按固定检查顺序排列。
+    """
 
     decision: Decision
     reason: DenyReason | None
@@ -115,9 +155,14 @@ class AdmissionResult:
     matched_rule: MatchedRule | None = None
     rate_limit: RateLimitPolicy | None = None
     detail: str = ""
+    rate_layers: tuple[RateLayerResult, ...] = ()
+    # 分层模式下各层策略本体的快照，仅供并发槽释放时精确定位信号量；
+    # 不参与对外判定展示，to_dict 时剔除
+    layer_policies: tuple[RateLimitPolicy, ...] = field(default=())
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data.pop("layer_policies", None)
         return data
 
 
@@ -135,3 +180,6 @@ class AuditRecord:
     rate_limit_name: str | None
     detail: str
     downstream_error: str | None = None
+    # 分层模式下各配额层的判定明细（含拦截层的阈值与当时用量）；
+    # 老模式恒为空，不进入对外 JSONL 序列化
+    rate_layers: tuple[RateLayerResult, ...] = ()

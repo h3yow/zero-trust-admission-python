@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "rate_limit_mode": "layered",
+  "metadata": {
+    "description": "分层配额示例：一个请求同时受身份档、租户/组档、资源整体档约束，任一层超限即拒绝。身份档需显式列出身份（通配身份会归入全局档）。"
+  },
+  "rules": [
+    {
+      "name": "deny-all-default",
+      "effect": "deny",
+      "identities": ["*"],
+      "groups": [],
+      "resources": ["*"],
+      "actions": ["*"],
+      "priority": 0
+    },
+    {
+      "name": "allow-alice-bob-read-docs",
+      "effect": "allow",
+      "identities": ["alice", "bob"],
+      "groups": [],
+      "resources": ["docs"],
+      "actions": ["read"],
+      "priority": 10
+    }
+  ],
+  "rate_limits": [
+    {
+      "name": "docs-rate-global",
+      "identities": ["*"],
+      "groups": [],
+      "resources": ["docs"],
+      "rate_limit": 100,
+      "rate_window_seconds": 1.0,
+      "concurrency": 20
+    },
+    {
+      "name": "docs-rate-tenant-dev",
+      "identities": ["*"],
+      "groups": ["dev"],
+      "resources": ["docs"],
+      "rate_limit": 40,
+      "rate_window_seconds": 1.0,
+      "concurrency": 8
+    },
+    {
+      "name": "docs-rate-per-identity",
+      "identities": ["alice", "bob"],
+      "groups": [],
+      "resources": ["docs"],
+      "rate_limit": 10,
+      "rate_window_seconds": 1.0,
+      "concurrency": 2
+    }
+  ]
+}
