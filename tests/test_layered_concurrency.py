@@ -252,3 +252,88 @@ def test_real_clock_concurrency_layer_refunds_in_burst():
     release_gate.set()
     for t in pool:
         t.join()
+
+
+def test_real_clock_same_specificity_order_is_name_independent_under_burst():
+    """真实时钟并发突发下，同具体度多层的判定/展示顺序只由书写位置决定。
+
+    三个同组（同具体度）层故意按"名字字典序与书写顺序相反"排列
+    （zzz 在前、aaa 在后）：若顺序跟名字走，高并发下会漂成 aaa 在前；
+    正确语义是任何一次判定、任何一条结果里层序都恒等于书写位置序。
+    """
+    sink = InMemoryAuditSink()
+    doc = PolicyDocument(
+        schema_version="1.0",
+        quota_mode="layered",
+        rules=(Rule("a", Effect.ALLOW, ("*",), (), ("docs",), ("*"), priority=10),),
+        rate_limits=(
+            # 书写位置 0：宽限层，永不拦截（名字字典序最大）
+            RateLimitPolicy("zzz-wide", ("*",), ("dev",), ("docs",),
+                            rate_limit=1_000, rate_window_seconds=WINDOW),
+            # 书写位置 1：唯一拦截层，窗口只放 8 个
+            RateLimitPolicy("mmm-blocker", ("*",), ("dev",), ("docs",),
+                            rate_limit=8, rate_window_seconds=WINDOW),
+            # 书写位置 2：宽限层（名字字典序最小，改名敏感实现会把它提前）
+            RateLimitPolicy("aaa-wide", ("*",), ("dev",), ("docs",),
+                            rate_limit=1_000, rate_window_seconds=WINDOW),
+        ),
+    )
+    guard = AdmissionGuard(PolicyStore(doc), sink)
+    req = AccessRequest(Principal("alice", ("dev",)), "docs", Action.READ)
+
+    n_threads = 16
+    per_thread = 4  # 共 64 次突发，阈值 8
+    results: list = []
+    results_lock = threading.Lock()
+    barrier = threading.Barrier(n_threads + 1)
+
+    def worker() -> None:
+        local = []
+        barrier.wait()
+        for _ in range(per_thread):
+            local.append(guard.evaluate(req))  # 真实时钟，不注入 now
+        with results_lock:
+            results.extend(local)
+        for r in local:
+            if r.decision is Decision.ALLOW:
+                guard.release(r)
+
+    pool = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in pool:
+        t.start()
+    barrier.wait()
+    for t in pool:
+        t.join()
+
+    expected_order = ("zzz-wide", "mmm-blocker", "aaa-wide")
+    # 每一次判定（放行与拒绝）的层链顺序都恒等于书写位置序
+    assert len(results) == n_threads * per_thread
+    for r in results:
+        assert tuple(l.policy_name for l in r.quota_layers) == expected_order
+        assert tuple(l.order for l in r.quota_layers) == (0, 1, 2)
+
+    allowed = [r for r in results if r.decision is Decision.ALLOW]
+    denied = [r for r in results if r.decision is Decision.DENY]
+    # 放行数严格等于拦截层阈值；所有拒绝唯一归因于书写位置 1 的限流层
+    assert len(allowed) == 8
+    assert len(denied) == n_threads * per_thread - 8
+    for r in denied:
+        assert r.reason is DenyReason.RATE_LIMITED
+        assert r.rate_limit.name == "mmm-blocker"
+        chain = {l.policy_name: l.allowed for l in r.quota_layers}
+        assert chain == {"zzz-wide": True, "mmm-blocker": False, "aaa-wide": None}
+
+    # 各层计数精确：被拦请求在前层 zzz-wide 的登记已全数退回，
+    # 三层窗口内都恰好只剩 8 次合规放行的登记，不漂、不串
+    rl = guard._rate_limiter  # type: ignore[attr-defined]
+    for name in expected_order:
+        policy = next(p for p in doc.rate_limits if p.name == name)
+        key, _ = layer_scope(req, policy)
+        assert rl.current_count_key(("layer-rate", name, key), WINDOW) == 8
+
+    # 审计条数与判定总数一致，拒绝原因全部可区分且唯一
+    assert len(sink.records) == n_threads * per_thread
+    deny_records = [r for r in sink.records if r.decision is Decision.DENY]
+    assert len(deny_records) == len(denied)
+    assert all(r.reason is DenyReason.RATE_LIMITED for r in deny_records)
+    assert all(r.rate_limit_name == "mmm-blocker" for r in deny_records)
