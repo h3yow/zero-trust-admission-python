@@ -88,12 +88,17 @@ def select_rate_limit_layers(
 ) -> tuple[RateLimitPolicy, ...]:
     """返回全部命中的限流策略，作为分层配额的各层。
 
-    顺序固定：具体度降序（显式身份 > 组 > 通配身份；显式资源 > 通配资源），
-    同分时按策略名称字典序升序，保证任何并发强度、任何命名下判定与展示
-    顺序都不漂移。
+    顺序固定且只由两处信息决定：
+
+    1. 具体度降序（显式身份 > 组 > 通配身份；显式资源 > 通配资源）；
+    2. 同具体度时按策略在**策略文件中的书写位置**升序（先写的先判定）。
+
+    排序键中刻意不含策略名称：``list.sort`` 是稳定排序，``candidates``
+    本身保持 ``policies`` 的书写次序，因此同具体度的层改名不会换位，
+    任何并发强度、任何命名下判定与展示顺序都不漂移。
     """
     candidates = [p for p in policies if rate_limit_matches_request(req, p)]
-    candidates.sort(key=lambda p: (-_specificity(p, req.principal), p.name))
+    candidates.sort(key=lambda p: -_specificity(p, req.principal))
     return tuple(candidates)
 
 

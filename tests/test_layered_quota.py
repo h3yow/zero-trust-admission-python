@@ -125,16 +125,117 @@ def test_layer_order_is_stable_regardless_of_definition_order():
     assert orders_seen == {("self-alice", "tenant-dev", "global")}
 
 
-def test_tie_broken_by_policy_name_deterministically():
-    # 同具体度（两个组层、都命中 dev）：按名称字典序
+def test_same_specificity_order_follows_file_position_not_name():
+    # 同具体度（两个组层、都命中 dev）：顺序只由文件书写位置决定。
+    # zzz 写在前面就 zzz 先判定，与名称字典序无关。
     doc = layered_doc(
         p_group("dev", name="zzz-layer", rate_limit=10),
         p_group("dev", name="aaa-layer", rate_limit=10),
     )
     g = guard_for(doc)
     r = g.evaluate(areq(), now=1.0)
-    assert [l.policy_name for l in r.quota_layers] == ["aaa-layer", "zzz-layer"]
+    assert [l.policy_name for l in r.quota_layers] == ["zzz-layer", "aaa-layer"]
+    assert [l.order for l in r.quota_layers] == [0, 1]
     g.release(r)
+
+
+def test_rename_never_changes_same_specificity_order_or_attribution():
+    # 文件位置不动、只改名字：展示顺序、拦截层（按位置）、拒绝原因都不变。
+    # 位置 0 的层阈值 1（第二次必满），位置 1 的层阈值 10（永不拦），
+    # 因此无论怎么改名，都必须是写在最前面的那一层以 rate_limited 拦截。
+    for first_name, second_name in (
+        ("zzz-layer", "aaa-layer"),
+        ("aaa-layer", "zzz-layer"),
+        ("m", "a"),
+    ):
+        doc = layered_doc(
+            p_group("dev", name=first_name, rate_limit=1, rate_window_seconds=100.0),
+            p_group("dev", name=second_name, rate_limit=10, rate_window_seconds=100.0),
+        )
+        g = guard_for(doc)
+        r1 = g.evaluate(areq(), now=1.0)
+        assert r1.decision is Decision.ALLOW
+        assert [l.policy_name for l in r1.quota_layers] == [first_name, second_name]
+        g.release(r1)
+
+        blocked = g.evaluate(areq(), now=1.1)
+        assert blocked.reason is DenyReason.RATE_LIMITED
+        assert blocked.rate_limit.name == first_name  # 先写的层承担拦截
+        names = [l.policy_name for l in blocked.quota_layers]
+        assert names == [first_name, second_name]
+        assert blocked.quota_layers[0].allowed is False
+        # 短路后的层标记"尚未判定"，但静态阈值仍可见
+        assert blocked.quota_layers[1].allowed is None
+        assert blocked.quota_layers[1].threshold == 10
+
+
+def test_simultaneous_blockers_same_specificity_first_written_wins():
+    # 同具体度两层同时够格拦截：位置 0 窗口已满、位置 1 并发已占满。
+    # 拦截层与拒绝原因必须由固定顺序唯一决定——先写的层以 rate_limited 拦截，
+    # 改名不能把它换成另一层、也不能把原因换成 concurrency_limited。
+    for first_name, second_name in (
+        ("zzz-rate", "aaa-conc"),
+        ("aaa-rate", "zzz-conc"),
+    ):
+        doc = layered_doc(
+            p_group("dev", name=first_name, rate_limit=1, rate_window_seconds=100.0),
+            p_group("dev", name=second_name, rate_limit=100,
+                    rate_window_seconds=100.0, concurrency=1),
+        )
+        g = guard_for(doc)
+        hold = g.evaluate(areq(), now=1.0)
+        assert hold.decision is Decision.ALLOW  # 占满位置 1 层的唯一并发槽
+        blocked = g.evaluate(areq(), now=1.1)
+        assert blocked.reason is DenyReason.RATE_LIMITED
+        assert blocked.rate_limit.name == first_name
+        layers = blocked.quota_layers
+        assert [l.policy_name for l in layers] == [first_name, second_name]
+        assert layers[0].allowed is False and layers[0].used == 1
+        # 并发层因短路未判定，但其并发上限仍可见
+        assert layers[1].allowed is None and layers[1].concurrency == 1
+        g.release(hold)
+
+
+def test_simultaneous_blockers_specificity_wins_over_file_order_and_name():
+    # 不同具体度两层同时够格拦截：组层窗口已满、资源整体层并发已占满。
+    # 无论把资源整体层写到文件多靠前、无论两层叫什么名字，
+    # 都必须是更具体的组层以 rate_limited 承担拦截。
+    for group_name, global_name in (
+        ("zzz-group", "aaa-global"),
+        ("aaa-group", "zzz-global"),
+    ):
+        doc = layered_doc(
+            # 资源整体层刻意写在文件最前面：位置救不了具体度
+            p_global(name=global_name, rate_limit=100,
+                     rate_window_seconds=100.0, concurrency=1),
+            p_group("dev", name=group_name, rate_limit=1, rate_window_seconds=100.0),
+        )
+        g = guard_for(doc)
+        hold = g.evaluate(areq(), now=1.0)
+        assert hold.decision is Decision.ALLOW  # 占满资源整体层的唯一并发槽
+        blocked = g.evaluate(areq(), now=1.1)
+        assert blocked.reason is DenyReason.RATE_LIMITED
+        assert blocked.rate_limit.name == group_name
+        names = [l.policy_name for l in blocked.quota_layers]
+        assert names == [group_name, global_name]
+        assert blocked.quota_layers[1].allowed is None
+        assert blocked.quota_layers[1].concurrency == 1
+        g.release(hold)
+
+
+def test_swapping_file_positions_swaps_same_specificity_order():
+    # 顺序只认书写位置：同具体度、同阈值的两层，调换书写位置后
+    # 展示顺序严格跟着文件走——位置是顺序的唯一依据。
+    a = p_group("dev", name="layer-a", rate_limit=10)
+    b = p_group("dev", name="layer-b", rate_limit=10)
+    g1 = guard_for(layered_doc(a, b))
+    r1 = g1.evaluate(areq(), now=1.0)
+    assert [l.policy_name for l in r1.quota_layers] == ["layer-a", "layer-b"]
+    g1.release(r1)
+    g2 = guard_for(layered_doc(b, a))
+    r2 = g2.evaluate(areq(), now=1.0)
+    assert [l.policy_name for l in r2.quota_layers] == ["layer-b", "layer-a"]
+    g2.release(r2)
 
 
 def test_middle_group_layer_blocks_and_identifies_itself():

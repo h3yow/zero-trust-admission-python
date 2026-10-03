@@ -252,3 +252,87 @@ def test_real_clock_concurrency_layer_refunds_in_burst():
     release_gate.set()
     for t in pool:
         t.join()
+
+
+def test_real_clock_same_specificity_order_stable_under_burst():
+    """真实时钟突发下，同具体度多层的判定/展示顺序只认文件书写位置。
+
+    两个组层都命中 dev：位置 0 阈值 8、位置 1 阈值 20。40 次并发突发下：
+    - 每次判定（允许或拒绝）的层顺序都必须严格等于文件书写顺序；
+    - 恰好 8 次放行、32 次被位置 0 的层以 rate_limited 拦截；
+    - 改名（位置不动）后上述结论逐字不变；
+    - 两层最终窗口计数都精确等于 8（被拒请求不占任何一层名额）。
+    """
+
+    def run(first_name: str, second_name: str) -> None:
+        doc = PolicyDocument(
+            schema_version="1.0",
+            quota_mode="layered",
+            rules=(
+                Rule("allow-all", Effect.ALLOW, ("*",), (), ("*",), ("*"), priority=10),
+            ),
+            rate_limits=(
+                RateLimitPolicy(
+                    first_name, ("*",), ("dev",), ("docs",),
+                    rate_limit=8, rate_window_seconds=WINDOW, concurrency=10_000,
+                ),
+                RateLimitPolicy(
+                    second_name, ("*",), ("dev",), ("docs",),
+                    rate_limit=20, rate_window_seconds=WINDOW, concurrency=10_000,
+                ),
+            ),
+        )
+        guard = AdmissionGuard(PolicyStore(doc), InMemoryAuditSink())
+        threads_n, per_thread = 8, 5  # 共 40 次突发
+        barrier = threading.Barrier(threads_n + 1)
+        lock = threading.Lock()
+        orders: set[tuple[str, ...]] = set()
+        stats: Counter = Counter()
+
+        def worker(tid: int) -> None:
+            req = AccessRequest(
+                Principal(f"user{tid % 3}", ("dev",)), "docs", Action.READ
+            )
+            local: Counter = Counter()
+            local_orders: set[tuple[str, ...]] = set()
+            barrier.wait()
+            for _ in range(per_thread):
+                result = guard.evaluate(req)  # 真实时钟，不注入 now
+                local_orders.add(tuple(l.policy_name for l in result.quota_layers))
+                if result.decision is Decision.ALLOW:
+                    local["allow"] += 1
+                    guard.release(result)
+                else:
+                    local["deny"] += 1
+                    assert result.reason is DenyReason.RATE_LIMITED
+                    assert result.rate_limit.name == first_name
+                    local["blocked_" + result.rate_limit.name] += 1
+            with lock:
+                orders.update(local_orders)
+                stats.update(local)
+
+        pool = [threading.Thread(target=worker, args=(i,)) for i in range(threads_n)]
+        for t in pool:
+            t.start()
+        barrier.wait()
+        for t in pool:
+            t.join()
+
+        # 40 次判定、两种结局，层顺序有且只有文件书写顺序这一种
+        assert orders == {(first_name, second_name)}
+        assert stats["allow"] == 8
+        assert stats["deny"] == 32
+        assert stats["blocked_" + first_name] == 32
+
+        # 各层计数精确：放行的 8 次在两层各登记一次，被拒的 32 次零登记
+        req = AccessRequest(Principal("user0", ("dev",)), "docs", Action.READ)
+        for name, threshold in ((first_name, 8), (second_name, 8)):
+            policy = next(p for p in doc.rate_limits if p.name == name)
+            sk, _ = layer_scope(req, policy)
+            assert guard._rate_limiter.current_count_key(  # type: ignore[attr-defined]
+                ("layer-rate", name, sk), WINDOW
+            ) == threshold
+
+    # 同一书写位置、两套完全不同且字典序相反的名字：结论必须逐字一致
+    run("zzz-first", "aaa-second")
+    run("aaa-first", "zzz-second")
